@@ -72,6 +72,10 @@ std::string KeystoreInfo::getHandle(const userid_t user_id) {
 	return uint2hex(value);
 }
 
+std::string KeystoreInfo::getNullHandle() {
+	return "0000000000000000";
+}
+
 std::string KeystoreInfo::getAlias(std::string handle) {
 	std::string alias(SYNTHETIC_PASSWORD_KEY_PREFIX);
 	alias = alias + handle;

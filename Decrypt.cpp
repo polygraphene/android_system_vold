@@ -97,6 +97,26 @@ using android::hardware::keymaster::V4_1::support::blob2hidlVec;
 using android::hardware::gatekeeper::V1_0::GatekeeperResponse;
 using GKResponse = ::android::service::gatekeeper::GateKeeperResponse;
 
+const char *PROFILE_KEY_NAME_DECRYPT_FORMAT = "profile_key_name_decrypt_%d";
+const size_t PROFILE_KEY_IV_SIZE = 12;
+const size_t PROFILE_KEY_MAC_BIT_LEN = 128;
+
+template<typename... Args>
+std::string Format_String(const std::string& format, Args&&... args) {
+	size_t size = std::snprintf(nullptr, 0, format.c_str(), std::forward<Args>(args)...) + 1; // Extra space for '\0'
+	std::unique_ptr<char[]> buf(new char[size]);
+	std::snprintf(buf.get(), size, format.c_str(), std::forward<Args>(args)...);
+	return std::string(buf.get(), buf.get() + size - 1); // We don't want the '\0' inside
+}
+
+android::hardware::hidl_vec<uint8_t> HidlVec(const std::string &val) {
+	return { (const uint8_t *)val.data(), (const uint8_t *)val.data() + val.size() };
+}
+
+android::hardware::hidl_vec<uint8_t> HidlVec(const void *val, size_t len) {
+	return { (const uint8_t *)val, (const uint8_t *)val + len };
+}
+
 inline std::string hidlVec2String(const ::keystore::hidl_vec<uint8_t>& value) {
     return std::string(reinterpret_cast<const std::string::value_type*>(&value[0]), value.size());
 }
@@ -440,7 +460,7 @@ namespace keystore {
 	* https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#867
 	* returning an empty string indicates an error */
 	std::string unwrapSyntheticPasswordBlob(const std::string& spblob_path, const std::string& handle_str, const userid_t user_id,
-		const void* application_id, const size_t application_id_size, uint32_t auth_token_len) {
+		const void* application_id, const size_t application_id_size, uint32_t auth_token_len, std::string &sp_key, int &sp_version) {
 		printf("Attempting to unwrap synthetic password blob\n");
 		std::string disk_decryption_secret_key = "";
 
@@ -456,6 +476,8 @@ namespace keystore {
 			printf("Unsupported synthetic password version %i\n", *byteptr);
 			return disk_decryption_secret_key;
 		}
+		sp_version = *byteptr;
+
 		const unsigned char* synthetic_password_version = byteptr;
 		byteptr++;
 		if (*byteptr != SYNTHETIC_PASSWORD_PASSWORD_BASED) {
@@ -521,7 +543,7 @@ namespace keystore {
 				keyResponse.metadata.key, begin_params.vector_data(), true,
 				&encOperationResponse);
 			if (!begin_rc.isOk()) {
-				printf("Begin Operation failed\n");
+				printf("Begin Operation failed: %s\n", begin_rc.getDescription().c_str());
 				return disk_decryption_secret_key;
 			}
 			std::optional<std::vector<uint8_t>> optPlaintext;
@@ -570,7 +592,11 @@ namespace keystore {
 			EVP_CIPHER_CTX_free(d_ctx);
 			free(personalized_application_id);
 			free(keystore_result);
+
+			// Pass original sp too to the caller.
 			int secret_key_real_size = actual_size - 16;
+			sp_key.assign((char *)secret_key, secret_key_real_size);
+
 			// printf("secret key:  "); output_hex((const unsigned char*)secret_key, secret_key_real_size); printf("\n");
 			// The payload data from the keystore update is further personalized at https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#153
 			// We now have the disk decryption key!
@@ -585,6 +611,96 @@ namespace keystore {
 			return disk_decryption_secret_key;
 		}
 		return disk_decryption_secret_key;
+	}
+
+	// Decrypt gatekeeper.profile.key with a keystore key.
+	// Encryption: https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/LockSettingsService.java#1211
+	// Decryption: https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/LockSettingsService.java#911
+	std::optional<std::string> Decrypt_Tied_Key(userid_t user_id, userid_t parent_user_id, std::string &profile_key) {
+		// Lock screen password of tied user is a randomly generated one.
+		// The implementation generates 40 bytes random key and then hex encodes it into 80 bytes.
+		// That 80 bytes key is used as 'password' type of a lock screen credential.
+		//
+		// To automatically unlock tied user, those 'password' is encrypted and stored in gatekeeper.profile.key.
+		//
+		// gatekeeper.profile.key = IV (12 bytes) + Encrypted profile key (96 bytes)
+
+		if (profile_key.size() < PROFILE_KEY_IV_SIZE) {
+			printf("Profile key is too short.\n");
+			return {};
+		}
+		std::string keystore_alias = Format_String(PROFILE_KEY_NAME_DECRYPT_FORMAT, user_id);
+
+		auto iv_hidlvec = HidlVec(profile_key.substr(0, PROFILE_KEY_IV_SIZE));
+		auto cipher_text_hidlvec = HidlVec(profile_key.substr(PROFILE_KEY_IV_SIZE));
+
+		auto begin_params = keymint::AuthorizationSetBuilder()
+			.Authorization(keymint::TAG_ALGORITHM, ::keymint::Algorithm::AES)
+			.Authorization(::keymint::TAG_BLOCK_MODE, ::keymint::BlockMode::GCM)
+			.Padding(::keymint::PaddingMode::NONE)
+			.Authorization(keymint::TAG_PURPOSE, keymint::KeyPurpose::DECRYPT)
+			.Authorization(::keymint::TAG_NONCE, iv_hidlvec)
+			.Authorization(::keymint::TAG_MAC_LENGTH, PROFILE_KEY_MAC_BIT_LEN);
+
+		::ndk::SpAIBinder keystoreBinder(AServiceManager_checkService("android.system.keystore2.IKeystoreService/default"));
+		auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
+
+		ks2::KeyEntryResponse keyEntryResponse;
+		auto rc = keystore->getKeyEntry(keystore::keyDescriptor(keystore_alias), &keyEntryResponse);
+		if (!rc.isOk()) {
+			auto error = keystore::unwrapError(rc);
+			if (ks2::ResponseCode(error) == ks2::ResponseCode::KEY_NOT_FOUND) {
+				printf("key not found\n");
+			} else {
+				printf("Failed to get key entry: %s\n", rc.getDescription().c_str());
+			}
+			return {};
+		}
+		ks2::CreateOperationResponse encOperationResponse;
+		rc = keyEntryResponse.iSecurityLevel->createOperation(
+				keyEntryResponse.metadata.key, begin_params.vector_data(), true,
+				&encOperationResponse);
+		if (!rc.isOk()) {
+			// FYI: If this operation failed with Status(-8, EX_SERVICE_SPECIFIC): '-26: ', it is most likely by the lack of auth token.
+			// Auth token should have been registared by second call of verify().
+			printf("Failed to begin operation: %s\n", rc.getDescription().c_str());
+			return {};
+		}
+		std::optional<std::vector<uint8_t>> optPlaintext;
+
+		rc = encOperationResponse.iOperation->finish(cipher_text_hidlvec, {}, &optPlaintext);
+		if (!rc.isOk()) {
+			printf("Failed to finish response: %s\n", rc.getDescription().c_str());
+			return {};
+		}
+
+		printf("Successfully decrypted profile key. Size=%zu bytes\n", optPlaintext->size());
+		return std::string((char *)&optPlaintext->front(), optPlaintext->size());
+	}
+
+	// Try to decrypt specified tied user (user_id) with already unlocked parent users (parent_user_id).
+	// https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/LockSettingsService.java#911
+	extern "C" bool Decrypt_Tied_User(userid_t user_id, userid_t parent_user_id) {
+		auto filename = Format_String("/data/system/users/%d/gatekeeper.profile.key", user_id);
+
+		if (!android::vold::pathExists(filename)) {
+			printf("Trying to decrypt tied (work profile) user, but %s is not found.\n", filename.c_str());
+			return false;
+		}
+		printf("Trying to decrypt tied (work profile) user. %s is found. parent is %d\n", filename.c_str(), parent_user_id);
+
+		std::string profile_key;
+		if (!android::base::ReadFileToString(filename, &profile_key)) {
+			printf("Error on reading %s: errno=%d\n", filename.c_str(), errno);
+			return false;
+		}
+
+		auto key = Decrypt_Tied_Key(user_id, parent_user_id, profile_key);
+		if (!key) {
+			return false;
+		}
+		// key should be 80 bytes and hex encoded.
+		return Decrypt_User(user_id, *key);
 	}
 }
 // /* C++ replacement for
@@ -809,14 +925,94 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 			}
 		}
 	}
+	std::string sp_key;
+	int sp_version = 0;
 	// Now we will handle https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#816
 	// Plus we will include the last bit that computes the disk decrypt key found in:
 	// https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#153
 	secret = android::keystore::unwrapSyntheticPasswordBlob(spblob_path, handle_str, user_id, (const void*)&application_id[0], 
-		PASSWORD_TOKEN_SIZE + SHA512_DIGEST_LENGTH, auth_token_len);
+		PASSWORD_TOKEN_SIZE + SHA512_DIGEST_LENGTH, auth_token_len, sp_key, sp_version);
 	if (!secret.size()) {
 		printf("failed to unwrapSyntheticPasswordBlob\n");
 		return Free_Return(retval, weaver_key, &pwd);
+	}
+
+	// Re-verify is not required in case of the default password, because profile key is not used for the default password.
+	if (Password != "!") {
+		// Call verify() again for sp handle to refresh auth token. It is required later for tied user decryption.
+		// https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#819
+
+		android::sp<android::hardware::gatekeeper::V1_0::IGatekeeper> gk_device;
+		gk_device = ::android::hardware::gatekeeper::V1_0::IGatekeeper::getService();
+		if (gk_device == nullptr) {
+			printf("failed to get gatekeeper service\n");
+			return Free_Return(retval, weaver_key, &pwd);
+		}
+		KeystoreInfo keystore_info;
+		std::string handle_str = keystore_info.getNullHandle();
+
+		std::string sp_handle;
+		if (!Get_Spblob_Data(spblob_path, handle_str, ".handle", "handle", &sp_handle)) {
+			printf("failed to get null protector handle\n");
+			return Free_Return(retval, weaver_key, &pwd);
+		}
+		std::string gatekeeperPassword;
+		char *buffer;
+		if (sp_version == SYNTHETIC_PASSWORD_VERSION_V3) {
+			// V3 uses SP800 instead of SHA512
+			buffer = (char *) PersonalizedHashSP800Binary(PERSONALIZATION_SP_GK_AUTH, PERSONALISATION_CONTEXT, sp_key.c_str(), sp_key.size());
+			if (!buffer) {
+				printf("malloc error getting gatekeeper_key\n");
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			gatekeeperPassword.append(buffer, SHA256_DIGEST_LENGTH);
+			free(buffer);
+		} else {
+			buffer = (char *) PersonalizedHashBinary(PERSONALIZATION_SP_GK_AUTH, sp_key.c_str(), sp_key.size());
+			if (!buffer) {
+				printf("malloc error getting gatekeeper_key\n");
+				return Free_Return(retval, weaver_key, &pwd);
+			}
+			gatekeeperPassword.append(buffer, SHA512_DIGEST_LENGTH);
+			free(buffer);
+		}
+		GKResponse gkResponse;
+		android::hardware::Return<void> hwRet =
+			gk_device->verify(user_id, 0 /* challenge */,
+							  HidlVec(sp_handle),
+							  HidlVec(gatekeeperPassword),
+							  [&gkResponse]
+							  // []
+								(const android::hardware::gatekeeper::V1_0::GatekeeperResponse &rsp) {
+									if (rsp.code >= android::hardware::gatekeeper::V1_0::GatekeeperStatusCode::STATUS_OK) {
+										gkResponse = GKResponse::ok({rsp.data.begin(), rsp.data.end()});
+										const hw_auth_token_t* hwAuthToken =
+										reinterpret_cast<const hw_auth_token_t*>(gkResponse.payload().data());
+										HardwareAuthToken authToken;
+										authToken.timestamp.milliSeconds = betoh64(hwAuthToken->timestamp);
+										authToken.challenge = hwAuthToken->challenge;
+										authToken.userId = hwAuthToken->user_id;
+										authToken.authenticatorId = hwAuthToken->authenticator_id;
+										authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
+												betoh32(hwAuthToken->authenticator_type));
+										authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
+										AIBinder* authzAIBinder = AServiceManager_getService("android.security.authorization");
+										::ndk::SpAIBinder binder(authzAIBinder);
+										auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
+										if (service == NULL) {
+											printf("error: could not connect to keystore service\n");
+											ALOGE("error: could not connect to keystore service\n");
+										}
+										auto binder_result = service->addAuthToken(authToken);
+									} else {
+										printf("Error on refreshing auth token. %d\n", rsp.code);
+									}
+							}
+						  );
+		if (!hwRet.isOk()) {
+			printf("gatekeeper verification failed on refreshing\n");
+			return Free_Return(retval, weaver_key, &pwd);
+		}
 	}
 
 	if (!Decrypt_CE_storage(user_id, token, secret)) {

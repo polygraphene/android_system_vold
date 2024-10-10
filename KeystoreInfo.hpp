@@ -23,6 +23,7 @@
 class KeystoreInfo {
 public:
 std::string getHandle(const userid_t user_id);
+std::string getNullHandle();
 std::string getAlias(std::string handle);
 
 private:
