@@ -32,8 +32,14 @@
 #include "HashPassword.h"
 
 #define PASS_PADDING_SIZE 128
-#define SHA512_HEX_SIZE SHA512_DIGEST_LENGTH * 2
-#define SHA256_HEX_SIZE SHA256_DIGEST_LENGTH * 2
+
+static std::string ToHex(const void *buffer, size_t size) {
+	size_t index = 0;
+	std::string str(size * 2, 0);
+	for(index = 0; index < size; index++)
+		sprintf((char *)str.data() + index * 2, "%02X", ((char *)buffer)[index]);
+	return str;
+}
 
 void* PersonalizedHashBinary(const char* prefix, const char* key, const size_t key_size) {
 	size_t size = PASS_PADDING_SIZE + key_size;
@@ -55,25 +61,11 @@ void* PersonalizedHashBinary(const char* prefix, const char* key, const size_t k
 }
 
 std::string PersonalizedHash(const char* prefix, const char* key, const size_t key_size) {
-	size_t size = PASS_PADDING_SIZE + key_size;
-	unsigned char* buffer = (unsigned char*)calloc(1, size);
-	if (!buffer) return ""; // failed to malloc
-	memcpy((void*)buffer, (void*)prefix, strlen(prefix));
-	unsigned char* ptr = buffer + PASS_PADDING_SIZE;
-	memcpy((void*)ptr, key, key_size);
-	unsigned char hash[SHA512_DIGEST_LENGTH];
-	SHA512_CTX sha512;
-	SHA512_Init(&sha512);
-	SHA512_Update(&sha512, buffer, size);
-	SHA512_Final(hash, &sha512);
-	int index = 0;
-	char hex_hash[SHA512_HEX_SIZE + 1];
-	for(index = 0; index < SHA512_DIGEST_LENGTH; index++)
-		sprintf(hex_hash + (index * 2), "%02X", hash[index]);
-	hex_hash[128] = 0;
-	std::string ret = hex_hash;
+	void *buffer = PersonalizedHashBinary(prefix, key, key_size);
+
+	auto hex_string = ToHex(buffer, SHA512_DIGEST_LENGTH);
 	free(buffer);
-	return ret;
+	return hex_string;
 }
 
 std::string PersonalizedHash(const char* prefix, const std::string& Password) {
@@ -81,6 +73,14 @@ std::string PersonalizedHash(const char* prefix, const std::string& Password) {
 }
 
 std::string PersonalizedHashSP800(const char* label, const char* context, const char* key, const size_t key_size) {
+	void *buffer = PersonalizedHashSP800Binary(label, context, key, key_size);
+
+	auto hex_string = ToHex(buffer, SHA256_DIGEST_LENGTH);
+	free(buffer);
+	return hex_string;
+}
+
+void* PersonalizedHashSP800Binary(const char* label, const char* context, const char* key, const size_t key_size) {
 	HMAC_CTX ctx;
 	HMAC_CTX_init(&ctx);
 	HMAC_Init_ex(&ctx, key, key_size, EVP_sha256(), NULL);
@@ -98,17 +98,11 @@ std::string PersonalizedHashSP800(const char* label, const char* context, const 
 	endianswap(&finalValue);
 	HMAC_Update(&ctx, (const unsigned char*)&finalValue, 4);
 
-	unsigned char output[SHA256_DIGEST_LENGTH];
+	uint8_t *output = (uint8_t *) malloc(SHA256_DIGEST_LENGTH);
 	unsigned int out_size = 0;
 	HMAC_Final(&ctx, output, &out_size);
-
-	int index = 0;
-	char hex_hash[SHA256_HEX_SIZE + 1];
-	for(index = 0; index < SHA256_DIGEST_LENGTH; index++)
-		sprintf(hex_hash + (index * 2), "%02x", output[index]);
-	hex_hash[SHA256_HEX_SIZE] = 0;
-	std::string ret = hex_hash;
-	return ret;
+	HMAC_CTX_cleanup(&ctx);
+	return output;
 }
 
 std::string HashPassword(const std::string& Password) {

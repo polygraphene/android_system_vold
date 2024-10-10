@@ -25,10 +25,14 @@
 #define PERSONALISATION_APPLICATION_ID "application-id"
 #define PERSONALIZATION_FBE_KEY "fbe-key"
 #define PERSONALIZATION_USER_GK_AUTH "user-gk-authentication"
+#define PERSONALIZATION_SP_GK_AUTH "sp-gk-authentication"
 #define PERSONALISATION_SECDISCARDABLE "secdiscardable-transform"
 #define PERSONALISATION_CONTEXT "android-synthetic-password-personalization-context"
 
+// Returns malloc'ed buffer of SHA512_DIGEST_LENGTH bytes. Remember to free.
 void* PersonalizedHashBinary(const char* prefix, const char* key, const size_t key_size);
+// Returns malloc'ed buffer of SHA256_DIGEST_LENGTH bytes. Remember to free.
+void* PersonalizedHashSP800Binary(const char* label, const char* context, const char* key, const size_t key_size);
 
 std::string PersonalizedHash(const char* prefix, const char* key, const size_t key_size);
 std::string PersonalizedHash(const char* prefix, const std::string& Password);
