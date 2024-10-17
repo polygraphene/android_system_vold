@@ -178,6 +178,16 @@ extern "C" int fscrypt_policy_size(const fscrypt_policy *fep) {
 	return 0;
 }
 
+extern "C" int fscrypt_policy_size_from_version(uint8_t version) {
+	switch (version) {
+		case FSCRYPT_POLICY_V1:
+			return sizeof(fscrypt_policy_v1);
+		case FSCRYPT_POLICY_V2:
+			return sizeof(fscrypt_policy_v2);
+	}
+	return 0;
+}
+
 void get_policy_content(fscrypt_policy* fep, char* content) {
 	if (!fep || !content) return;
 	switch(fep->version) {

@@ -79,6 +79,8 @@ uint8_t get_policy_size(fscrypt_policy* fep, bool hex);
 
 int fscrypt_policy_size(const fscrypt_policy *policy);
 
+int fscrypt_policy_size_from_version(uint8_t policy_version);
+
 void get_policy_content(fscrypt_policy* fep, char* content);
 __END_DECLS
 
